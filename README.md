@@ -2,19 +2,33 @@
 cuda programming examples
 
 CUDA Architecture CC version
+
 Tegra X2	6.2	nvcc_ARCH = -gencode=arch=compute_62,code="sm_62,compute_62"
+
 GeForce GTX 1080	6.1 (CUDA 8)	nvcc_ARCH = -gencode=arch=compute_61,code="sm_61,compute_61"
+
 GeForce GTX 1070	6.1 (CUDA 8)	nvcc_ARCH = -gencode=arch=compute_61,code="sm_61,compute_61"
+
 GeForce GTX 1060	6.1 (CUDA 8)	nvcc_ARCH = -gencode=arch=compute_61,code="sm_61,compute_61"
+
 Tesla P100	6.0 (CUDA 8)	nvcc_ARCH = -gencode=arch=compute_60,code="sm_60,compute_60"
+
 Tegra X1	5.3	nvcc_ARCH = -gencode=arch=compute_53,code="sm_53,compute_53"
+
 GeForce GTX TITAN X	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 980 Ti	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 980	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 970	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 960	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 950	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 GeForce GTX 980	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
+
 -----------------------------------------------------------------------------------
 GeForce GTX 980M	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
 GeForce GTX 970M	5.2	nvcc_ARCH = -gencode=arch=compute_52,code="sm_52,compute_52"
