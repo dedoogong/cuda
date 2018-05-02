@@ -1,10 +1,17 @@
 ./sumMatrixOnGPU Starting...
+
 Using Device 0: GeForce GTX 960
+
 Matrix size: nx 1024 ny 1024
+
 Matrix initialization elapsed 0.045114 sec
+
 sumMatrixOnHost elapsed 0.001137 sec
+
 sumMatrixOnGPU2D <<<  (32,32), (32,32)  >>> elapsed 0.000255 sec
+
 sumMatrixOnGPU2D <<<  (64,32), (16,32)  >>> elapsed 0.000160 sec
+
 sumMatrixOnGPU2D <<<  (32,64), (32,16)  >>> elapsed 0.000162 sec
 sumMatrixOnGPU2D <<<  (64,64), (16,16)  >>> elapsed 0.000160 sec
 sumMatrixOnGPU2D <<<  (16,64), (64,16)  >>> elapsed 0.000160 sec
