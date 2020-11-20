@@ -1,1036 +1,478 @@
-#include "common.h"
+//build commnad : nvcc -std=c++11 -lcudnn -lcublas kernel.cu -o kernel
+
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <iostream>
-#include <iomanip>
-#include <conio.h>
 #include <assert.h>
+#include <pthread.h>
+#include "common/common.h"
+#include <stdlib.h>
+#include <cuda.h>
+#include "cublas_v2.h"
 
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <helper_cuda.h>
-
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
-#include <thrust/generate.h>
-#include <thrust/reduce.h>
-#include <thrust/functional.h>
-#include <thrust/random.h>
-#include <thrust/sequence.h>
-#include <thrust/random.h>
-#include <thrust/gather.h>
-#include <thrust/scan.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-
-
-#define N   1025
-#define M   12
-
-//#include "Utilities.cuh"
-//#include "TimingGPU.cuh"
-
-
-/*simpleBLAS Matrix size */
-#define N2 (275) 
-
-#define BLOCK_SIZE_X 16
-#define BLOCK_SIZE_Y 16
-
-/**********************/
-/* cuBLAS ERROR CHECK */
-/**********************/
-#ifndef cublasSafeCall
-#define cublasSafeCall(err)     __cublasSafeCall(err, __FILE__, __LINE__)
+inline
+cudaError_t checkCuda(cudaError_t result)
+{
+#if defined(DEBUG) || defined(_DEBUG)
+  if (result != cudaSuccess) {
+    fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+    assert(result == cudaSuccess);
+  }
 #endif
+  return result;
+}
 
+///////////////////////////////////////////////////////////////////////
 
-__device__ int foo(int row, int col)
+__global__ void staticReverse(int *d, int n)
 {
-    return (2 * row);
+  __shared__ int s[64];
+  int t = threadIdx.x;
+  int tr = n-t-1;
+  s[t] = d[t];
+  __syncthreads();
+  d[t] = s[tr];
 }
 
-__global__ void kernel(int **arr)
+__global__ void dynamicReverse(int *d, int n)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int i;
- 
-    for ( ; tid < N; tid++)
-    {
-        for (i = 0; i < M; i++)
-        {
-            arr[tid][i] = foo(tid, i);
-        }
-    }
+  extern __shared__ int s[];
+  int t = threadIdx.x;
+  int tr = n-t-1;
+  s[t] = d[t];
+  __syncthreads();
+  d[t] = s[tr];
 }
 
-int debug_segfault(int argc, char **argv)
+int shared_memory_reverse(void)
 {
-    int i; 
-    int **h_matrix; 
-    int **d_ptrs; 
-    int **d_matrix;
+  const int n = 64;
+  int a[n], r[n], d[n];
 
-    h_matrix = (int **)malloc(N * sizeof(int *));
-    d_ptrs = (int **)malloc(N * sizeof(int *));
-    CHECK(cudaMalloc((void **)&d_matrix, N * sizeof(int *)));
-    CHECK(cudaMemset(d_matrix, 0x00, N * sizeof(int *)));
- 
-    for (i = 0; i < N; i++)
-    {
-        h_matrix[i] = (int *)malloc(M * sizeof(int));
-        CHECK(cudaMalloc((void **)&d_ptrs[i], M * sizeof(int)));
-        CHECK(cudaMemset(d_ptrs[i], 0x00, M * sizeof(int)));
-    }
-
-    int threadsPerBlock = 256;
-    int blocksPerGrid = 1024;
-    kernel<<<blocksPerGrid, threadsPerBlock>>>(d_matrix);
- 
-    for (i = 0; i < N; i++)
-    {
-        CHECK(cudaMemcpy(h_matrix[i], d_ptrs[i], M * sizeof(int),
-                        cudaMemcpyDeviceToHost));
-        CHECK(cudaFree(d_ptrs[i]));
-        free(h_matrix[i]);
-    }
-
-    CHECK(cudaFree(d_matrix));
-    free(h_matrix);
-
-    return 0;
-}
-
-
-int debug_segfault_fixed(int argc, char **argv)
-{
-    int i; 
-    int **h_matrix; 
-    int **d_ptrs; 
-    int **d_matrix;
-
-    h_matrix = (int **)malloc(N * sizeof(int *));
-    d_ptrs = (int **)malloc(N * sizeof(int *));
-    CHECK(cudaMalloc((void **)&d_matrix, N * sizeof(int *)));
-    CHECK(cudaMemset(d_matrix, 0x00, N * sizeof(int *)));
- 
-    for (i = 0; i < N; i++)
-    {
-        h_matrix[i] = (int *)malloc(M * sizeof(int));
-        CHECK(cudaMalloc((void **)&d_ptrs[i], M * sizeof(int)));
-        CHECK(cudaMemset(d_ptrs[i], 0x00, M * sizeof(int)));
-    }
-
-    CHECK(cudaMemcpy(d_matrix, d_ptrs, N * sizeof(int *),
-                    cudaMemcpyHostToDevice));
-
-    int threadsPerBlock = 256;
-    int blocksPerGrid = 1024;
-    kernel<<<blocksPerGrid, threadsPerBlock>>>(d_matrix);
- 
-    for (i = 0; i < N; i++)
-    {
-        CHECK(cudaMemcpy(h_matrix[i], d_ptrs[i], M * sizeof(int),
-                        cudaMemcpyDeviceToHost));
-        CHECK(cudaFree(d_ptrs[i]));
-        free(h_matrix[i]);
-    }
-
-    CHECK(cudaFree(d_matrix));
-    free(h_matrix);
-
-    return 0;
-}
-
-
-__global__ void simple_reduction(int *shared_var, int *input_values, int N,
-                                 int iters)
-{
-    __shared__ int local_mem[256];
-    int iter, i;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int local_tid = threadIdx.x;
-    int local_dim = blockDim.x;
-    int minThreadInThisBlock = blockIdx.x * blockDim.x;
-    int maxThreadInThisBlock = minThreadInThisBlock + (blockDim.x - 1);
-
-    if (maxThreadInThisBlock >= N)
-    {
-        local_dim = N - minThreadInThisBlock;
-    }
-
-    for (iter = 0; iter < iters; iter++)
-    {
-        if (tid < N)
-        {
-            local_mem[local_tid] = input_values[tid];
-        }
-
-        // Required for correctness
-        // __syncthreads();
- 
-        if (local_tid == 0)
-        {
-            int sum = 0;
-
-            for (i = 0; i < local_dim; i++)
-            {
-                sum = sum + local_mem[i];
-            }
-
-            atomicAdd(shared_var, sum);
-        }
-
-        // Required for correctness
-        // __syncthreads();
-    }
-}
-
-int debug_hazard(int argc, char **argv)
-{
-    int N = 20480;
-    int block = 256;
-    int device_iters = 3;
-    int runs = 1;
-    int i, true_value;
-    int *d_shared_var, *d_input_values, *h_input_values;
-    int h_sum;
-    double mean_time = 0.0;
-
-    CHECK(cudaMalloc((void **)&d_shared_var, sizeof(int)));
-    CHECK(cudaMalloc((void **)&d_input_values, N * sizeof(int)));
-    h_input_values = (int *)malloc(N * sizeof(int));
-
-    for (i = 0; i < N; i++)
-    {
-        h_input_values[i] = i;
-        true_value += i;
-    }
-
-    true_value *= device_iters;
-
-    for (i = 0; i < runs; i++)
-    {
-        CHECK(cudaMemset(d_shared_var, 0x00, sizeof(int)));
-        CHECK(cudaMemcpy(d_input_values, h_input_values, N * sizeof(int),
-                         cudaMemcpyHostToDevice));
-        double start = seconds();
-
-        simple_reduction<<<N / block, block>>>(d_shared_var,
-                d_input_values, N, device_iters);
-
-        CHECK(cudaDeviceSynchronize());
-        mean_time += seconds() - start;
-        CHECK(cudaMemcpy(&h_sum, d_shared_var, sizeof(int),
-                         cudaMemcpyDeviceToHost));
-
-        if (h_sum != true_value)
-        {
-            fprintf(stderr, "Validation failure: expected %d, got %d\n",
-                    true_value, h_sum);
-            return 1;
-        }
-    }
-
-    mean_time /= runs;
-
-    printf("Mean execution time for reduction: %.4f ms\n",
-           mean_time * 1000.0);
-
-    return 0;
-}
-
-
-
-/* Host implementation of a simple version of sgemm */
-static void simple_sgemm(int n, float alpha, const float *A, const float *B,
-                         float beta, float *C) {
-  int i;
-  int j;
-  int k;
-
-  for (i = 0; i < n; ++i) {
-    for (j = 0; j < n; ++j) {
-      float prod = 0;
-
-      for (k = 0; k < n; ++k) {
-        prod += A[k * n + i] * B[j * n + k];
-      }
-
-      C[j * n + i] = alpha * prod + beta * C[j * n + i];
-    }
+  for (int i = 0; i < n; i++) {
+    a[i] = i;
+    r[i] = n-i-1;
+    d[i] = 0;
   }
-}
+  printf("original array elemtns\n");
 
-int simpleCublas(int argc, char **argv) {
-  cublasStatus_t status;
-  float *h_A;
-  float *h_B;
-  float *h_C;
-  float *h_C_ref;
-  float *d_A = 0;
-  float *d_B = 0;
-  float *d_C = 0;
-  float alpha = 1.0f;
-  float beta = 0.0f;
-  int n2 = N2 * N2;
-  int i;
-  float error_norm;
-  float ref_norm;
-  float diff;
-  cublasHandle_t handle;
-
-  int dev = findCudaDevice(argc, (const char **)argv);
-
-  if (dev == -1) {
-    return EXIT_FAILURE;
+  for (int i = 0; i < n; i++) {
+      printf("%d ",a[i]);
   }
 
-  /* Initialize CUBLAS */
-  printf("simpleCUBLAS test running..\n");
+  int *d_d;
+  cudaMalloc(&d_d, n * sizeof(int));
+
+  // 정적 공유 메모리 버전
+  cudaMemcpy(d_d, a, n*sizeof(int), cudaMemcpyHostToDevice);
+  staticReverse<<<1,n>>>(d_d, n);
+  cudaMemcpy(d, d_d, n*sizeof(int), cudaMemcpyDeviceToHost);
+  for (int i = 0; i < n; i++)
+    if (d[i] != r[i]) printf("Error: d[%d]!=r[%d] (%d, %d)\n", i, i, d[i], r[i]);
+
+  // 동적 공유 메모리 버전
+  cudaMemcpy(d_d, a, n*sizeof(int), cudaMemcpyHostToDevice);
+  dynamicReverse<<<1,n,n*sizeof(int)>>>(d_d, n);
+  cudaMemcpy(d, d_d, n * sizeof(int), cudaMemcpyDeviceToHost);
+
+  printf("\nreverse results\n");
+  int flag=1;
+  for (int i = 0; i < n; i++)
+    if (d[i] != r[i]){ flag=0; printf("Error: d[%d]!=r[%d] (%d, %d)\n", i, i, d[i], r[i]);}
+    else printf("%d ",r[i]);
+  if(flag)printf("\nall array elements are correctly reversed\n");
 
-  status = cublasCreate(&handle);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! CUBLAS initialization error\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Allocate host memory for the matrices */
-  h_A = reinterpret_cast<float *>(malloc(n2 * sizeof(h_A[0])));
-
-  if (h_A == 0) {
-    fprintf(stderr, "!!!! host memory allocation error (A)\n");
-    return EXIT_FAILURE;
-  }
-
-  h_B = reinterpret_cast<float *>(malloc(n2 * sizeof(h_B[0])));
-
-  if (h_B == 0) {
-    fprintf(stderr, "!!!! host memory allocation error (B)\n");
-    return EXIT_FAILURE;
-  }
-
-  h_C = reinterpret_cast<float *>(malloc(n2 * sizeof(h_C[0])));
-
-  if (h_C == 0) {
-    fprintf(stderr, "!!!! host memory allocation error (C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Fill the matrices with test data */
-  for (i = 0; i < n2; i++) {
-    h_A[i] = rand() / static_cast<float>(RAND_MAX);
-    h_B[i] = rand() / static_cast<float>(RAND_MAX);
-    h_C[i] = rand() / static_cast<float>(RAND_MAX);
-  }
-
-  /* Allocate device memory for the matrices */
-  if (cudaMalloc(reinterpret_cast<void **>(&d_A), n2 * sizeof(d_A[0])) !=
-      cudaSuccess) {
-    fprintf(stderr, "!!!! device memory allocation error (allocate A)\n");
-    return EXIT_FAILURE;
-  }
-
-  if (cudaMalloc(reinterpret_cast<void **>(&d_B), n2 * sizeof(d_B[0])) !=
-      cudaSuccess) {
-    fprintf(stderr, "!!!! device memory allocation error (allocate B)\n");
-    return EXIT_FAILURE;
-  }
-
-  if (cudaMalloc(reinterpret_cast<void **>(&d_C), n2 * sizeof(d_C[0])) !=
-      cudaSuccess) {
-    fprintf(stderr, "!!!! device memory allocation error (allocate C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Initialize the device matrices with the host matrices */
-  status = cublasSetVector(n2, sizeof(h_A[0]), h_A, 1, d_A, 1);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! device access error (write A)\n");
-    return EXIT_FAILURE;
-  }
-
-  status = cublasSetVector(n2, sizeof(h_B[0]), h_B, 1, d_B, 1);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! device access error (write B)\n");
-    return EXIT_FAILURE;
-  }
-
-  status = cublasSetVector(n2, sizeof(h_C[0]), h_C, 1, d_C, 1);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! device access error (write C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Performs operation using plain C code */
-  simple_sgemm(N2, alpha, h_A, h_B, beta, h_C);
-  h_C_ref = h_C;
-
-  /* Performs operation using cublas */
-  status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N2, N2, N2, &alpha, d_A,
-                       N2, d_B, N2, &beta, d_C, N2);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! kernel execution error.\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Allocate host memory for reading back the result from device memory */
-  h_C = reinterpret_cast<float *>(malloc(n2 * sizeof(h_C[0])));
-
-  if (h_C == 0) {
-    fprintf(stderr, "!!!! host memory allocation error (C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Read the result back */
-  status = cublasGetVector(n2, sizeof(h_C[0]), d_C, 1, h_C, 1);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! device access error (read C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Check result against reference */
-  error_norm = 0;
-  ref_norm = 0;
-
-  for (i = 0; i < n2; ++i) {
-    diff = h_C_ref[i] - h_C[i];
-    error_norm += diff * diff;
-    ref_norm += h_C_ref[i] * h_C_ref[i];
-  }
-
-  error_norm = static_cast<float>(sqrt(static_cast<double>(error_norm)));
-  ref_norm = static_cast<float>(sqrt(static_cast<double>(ref_norm)));
-
-  if (fabs(ref_norm) < 1e-7) {
-    fprintf(stderr, "!!!! reference norm is 0\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Memory clean up */
-  free(h_A);
-  free(h_B);
-  free(h_C);
-  free(h_C_ref);
-
-  if (cudaFree(d_A) != cudaSuccess) {
-    fprintf(stderr, "!!!! memory free error (A)\n");
-    return EXIT_FAILURE;
-  }
-
-  if (cudaFree(d_B) != cudaSuccess) {
-    fprintf(stderr, "!!!! memory free error (B)\n");
-    return EXIT_FAILURE;
-  }
-
-  if (cudaFree(d_C) != cudaSuccess) {
-    fprintf(stderr, "!!!! memory free error (C)\n");
-    return EXIT_FAILURE;
-  }
-
-  /* Shutdown */
-  status = cublasDestroy(handle);
-
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "!!!! shutdown error (A)\n");
-    return EXIT_FAILURE;
-  }
-
-  if (error_norm / ref_norm < 1e-6f) {
-    printf("simpleCUBLAS test passed.\n");
-    exit(EXIT_SUCCESS);
-  } else {
-    printf("simpleCUBLAS test failed.\n");
-    exit(EXIT_FAILURE);
-  }
-}
-
-/*
-Calculating the all-pairs distances between points in two different sets in CUDA can be solved by observing that
-
-||x-y||^2=||x||^2+||y||^2-2*<x,y>
-where ||×|| is the l2 norm and <x,y> denotes the scalar product between x and y.
-
-The norms ||x|| and ||y|| can be calculated by approaches inspired by Reduce matrix rows with CUDA, while the scalar products <x,y> can then be calculated as the matrix-matrix multiplication X*Y^T using cublas<t>gemm().
-
-A fully worked out implementation is available on our GitHub page.
-
-Please, note that for the calculation of the norms ||×|| two approaches are reported, one using cuBLAS cublas<t>gemv and one using Thurst’s transform.
-
-For a problem size of typical interest (1000/2000 elements in the sets each with 128 dimensions), we have experienced the following timings on a GT540M card:
-
-
-Approach nr. 1   0.12 ms
-Approach nr. 2   0.59 ms
-*/
-
-
-/***********************************************************/
-/* SQUARED ABSOLUTE VALUE FUNCTOR - NEEDED FOR APPROACH #1 */
-/***********************************************************/
-struct abs2 {
-	__host__ __device__ double operator()(const float &x) const { return x * x; }
-};
-
-// --- Required for approach #2
-__device__ float *vals;
-
-/******************************************/
-/* ROW_REDUCTION - NEEDED FOR APPROACH #2 */
-/******************************************/
-struct row_reduction {
-
-    const int Ncols;    // --- Number of columns
-
-    row_reduction(int _Ncols) : Ncols(_Ncols) {}
-
-    __device__ float operator()(float& x, int& y ) {
-        float temp = 0.f;
-        for (int i = 0; i<Ncols; i++)
-            temp += vals[i + (y*Ncols)] * vals[i + (y*Ncols)];
-        return temp;
-    }
-};
-
-/************************************************/
-/* KERNEL FUNCTION TO ASSEMBLE THE FINAL RESULT */
-/************************************************/
-__global__ void assemble_final_result(const float * __restrict__ d_norms_x_2, const float * __restrict__ d_norms_y_2, float * __restrict__ d_dots,
-									  const int NX, const int NY) {
-
-	const int i = threadIdx.x + blockIdx.x * gridDim.x;
-	const int j = threadIdx.y + blockIdx.y * gridDim.y;
-
-	if ((i < NY) && (j < NX)) d_dots[i * NX+ j] = d_norms_x_2[j] + d_norms_y_2[i] - 2 * d_dots[i * NX+ j];
-
-}
-
-/********/
-/* MAIN */
-/********/
-int two_point_pair_distance(){
-    //const int Ndims = 128;		// --- Number of rows
-    //const int NX	= 1000;		// --- Number of columns
-    //const int NY	= 2000;		// --- Number of columns
-
-    const int Ndims = 3;		// --- Number of rows
-    const int NX	= 4;		// --- Number of columns
-    const int NY	= 5;		// --- Number of columns
-
-	// --- Random uniform integer distribution between 10 and 99
-    thrust::default_random_engine rng;
-    thrust::uniform_int_distribution<int> dist(10, 99);
-
-    // --- Matrices allocation and initialization
-    thrust::device_vector<float> d_X(Ndims * NX);
-    thrust::device_vector<float> d_Y(Ndims * NY);
-    for (size_t i = 0; i < d_X.size(); i++) d_X[i] = (float)dist(rng);
-    for (size_t i = 0; i < d_Y.size(); i++) d_Y[i] = (float)dist(rng);
-
-    TimingGPU timerGPU;
-
-	// --- cuBLAS handle creation
-	cublasHandle_t handle;
-    cublasSafeCall(cublasCreate(&handle));
-
-	/**********************************************/
-    /* CALCULATING THE NORMS OF THE ELEMENTS OF X */
-    /**********************************************/
-    thrust::device_vector<float> d_norms_x_2(NX);
-
-	// --- Approach nr. 1
-	//timerGPU.StartCounter();
-	thrust::device_vector<float> d_X_2(Ndims * NX);
-	thrust::transform(d_X.begin(), d_X.end(), d_X_2.begin(), abs2());
-
-	thrust::device_vector<float> d_ones(Ndims, 1.f);
-
-    float alpha = 1.f;
-    float beta  = 0.f;
-    cublasSafeCall(cublasSgemv(handle, CUBLAS_OP_T, Ndims, NX, &alpha, thrust::raw_pointer_cast(d_X_2.data()), Ndims, 
-                               thrust::raw_pointer_cast(d_ones.data()), 1, &beta, thrust::raw_pointer_cast(d_norms_x_2.data()), 1));
-	
-	//printf("Timing for approach #1 = %f\n", timerGPU.GetCounter());
-
-    // --- Approach nr. 2
-	//timerGPU.StartCounter();
- //   float *s_vals = thrust::raw_pointer_cast(&d_X[0]);
- //   gpuErrchk(cudaMemcpyToSymbol(vals, &s_vals, sizeof(float *)));
- //   thrust::transform(d_norms_x_2.begin(), d_norms_x_2.end(), thrust::counting_iterator<int>(0),  d_norms_x_2.begin(), row_reduction(Ndims));
-
-	//printf("Timing for approach #2 = %f\n", timerGPU.GetCounter());
-
-	/**********************************************/
-    /* CALCULATING THE NORMS OF THE ELEMENTS OF Y */
-    /**********************************************/
-    thrust::device_vector<float> d_norms_y_2(NX);
-
-	thrust::device_vector<float> d_Y_2(Ndims * NX);
-	thrust::transform(d_Y.begin(), d_Y.end(), d_Y_2.begin(), abs2());
-
-    cublasSafeCall(cublasSgemv(handle, CUBLAS_OP_T, Ndims, NY, &alpha, thrust::raw_pointer_cast(d_Y_2.data()), Ndims, 
-                               thrust::raw_pointer_cast(d_ones.data()), 1, &beta, thrust::raw_pointer_cast(d_norms_y_2.data()), 1));
-
-
-	/***********************************/
-    /* CALCULATING THE SCALAR PRODUCTS */
-    /***********************************/
-    thrust::device_vector<float> d_dots(NX * NY);
-
-	cublasSafeCall(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, NX, NY, Ndims, &alpha,
-		                       thrust::raw_pointer_cast(d_X.data()), Ndims, thrust::raw_pointer_cast(d_Y.data()), Ndims, &beta,
-							   thrust::raw_pointer_cast(d_dots.data()), NX));
-
-	/*****************************/
-	/* ASSEMBLE THE FINAL RESULT */
-	/*****************************/
-	
-	dim3 dimBlock(BLOCK_SIZE_X, BLOCK_SIZE_Y);
-	dim3 dimGrid(iDivUp(NX, BLOCK_SIZE_X), iDivUp(NY, BLOCK_SIZE_Y));
-	assemble_final_result<<<dimGrid, dimBlock>>>(thrust::raw_pointer_cast(d_norms_x_2.data()), thrust::raw_pointer_cast(d_norms_y_2.data()), 
-		                                         thrust::raw_pointer_cast(d_dots.data()), NX, NY);
-	
-	for(int i = 0; i < NX * NY; i++) std::cout << d_dots[i] << "\n";
-
-	return 0;
-}
-
-/*
-We are here providing a full example on how using cublas <t>gemm to perform multiplications between submatrices of full matrices A and B and how assigning the result to a submatrix of a full matrix C.
-
-The code makes use of
-
-pointer arithmetics to access submatrices;
-the concept of the leading dimension and of submatrix dimensions.
- 
-
-The code available on our GitHub page considers three matrices:
-
-A – 10 x 9;
-B – 15 x 13;
-C – 10 x 12.
- 
-Matrix C is initialized to all 10s.
-The code performs the following submatrix multiplication in Matlab language:
-
-C(1+x3:5+x3,1+y3:3+y3) = A(1+x1:5+x1,1+y1:4+y1) * B(1+x2:4+x2,1+y2:3+x2);
-*/
-
-
-/********/
-/* MAIN */
-/********/
-int submatrix_multiplication()
-{
-	/**************************/
-	/* SETTING UP THE PROBLEM */
-	/**************************/
-  
-	//const int Nrows1 = 10;			// --- Number of rows of matrix 1
-	//const int Ncols1 = 10;			// --- Number of columns of matrix 1
-
-	//const int Nrows2 = 15;			// --- Number of rows of matrix 2
-	//const int Ncols2 = 15;			// --- Number of columns of matrix 2
-
-	//const int Nrows3 = 12;			// --- Number of rows of matrix 3
-	//const int Ncols3 = 12;			// --- Number of columns of matrix 3
-
-	const int Nrows1 = 10;			// --- Number of rows of matrix 1
-	const int Ncols1 = 9;			// --- Number of columns of matrix 1
-
-	const int Nrows2 = 15;			// --- Number of rows of matrix 2
-	const int Ncols2 = 13;			// --- Number of columns of matrix 2
-
-	const int Nrows3 = 10;			// --- Number of rows of matrix 3
-	const int Ncols3 = 12;			// --- Number of columns of matrix 3
-
-	const int Nrows = 5;			// --- Number of rows of submatrix matrix 3 = Number of rows of submatrix 1
-	const int Ncols = 3;			// --- Number of columns of submatrix matrix 3 = Number of columns of submatrix 2
-
-	const int Nrowscols = 4;		// --- Number of columns of submatrix 1 and of rows of submatrix 2
-
-	const int x1 = 3;				// --- Offset for submatrix multiplication along the rows
-	const int y1 = 2;				// --- Offset for submatrix multiplication along the columns
-	
-	const int x2 = 6;				// --- Offset for submatrix multiplication along the rows
-	const int y2 = 4;				// --- Offset for submatrix multiplication along the columns
-
-	const int x3 = 3;				// --- Offset for submatrix multiplication along the rows
-	const int y3 = 5;				// --- Offset for submatrix multiplication along the columns
-
-	// --- Random uniform integer distribution between 0 and 100
-	thrust::default_random_engine rng;
-	thrust::uniform_int_distribution<int> dist(0, 20);
-
-	// --- Matrix allocation and initialization
-	thrust::device_vector<float> d_matrix1(Nrows1 * Ncols1);
-	thrust::device_vector<float> d_matrix2(Nrows2 * Ncols2);
-	for (size_t i = 0; i < d_matrix1.size(); i++) d_matrix1[i] = (float)dist(rng);
-	for (size_t i = 0; i < d_matrix2.size(); i++) d_matrix2[i] = (float)dist(rng);
-
-	printf("\n\nOriginal full size matrix A\n");
-	for(int i = 0; i < Nrows1; i++) {
-		std::cout << "[ ";
-		for(int j = 0; j < Ncols1; j++) 
-			std::cout << d_matrix1[j * Nrows1 + i] << " ";
-		std::cout << "]\n";
-	}
-
-	printf("\n\nOriginal full size matrix B\n");
-	for(int i = 0; i < Nrows2; i++) {
-		std::cout << "[ ";
-		for(int j = 0; j < Ncols2; j++) 
-			std::cout << d_matrix2[j * Nrows2 + i] << " ";
-		std::cout << "]\n";
-	}
-
-	/*************************/
-	/* MATRIX MULTIPLICATION */
-	/*************************/
-	cublasHandle_t handle;
-
-	cublasSafeCall(cublasCreate(&handle));
-
-	thrust::device_vector<float> d_matrix3(Nrows3 * Ncols3, 10.f);
-
-	float alpha = 1.f;
-	float beta  = 0.f;
-	cublasSafeCall(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, Nrows, Ncols, Nrowscols, &alpha,
-				   thrust::raw_pointer_cast(d_matrix1.data())+x1+Nrows1*y1, Nrows1, thrust::raw_pointer_cast(d_matrix2.data())+x2+Nrows2*y2, Nrows2,
-				   &beta, thrust::raw_pointer_cast(d_matrix3.data())+x3+Nrows3*y3, Nrows3));
-
-	printf("\n\nResult full size matrix C\n");
-	for(int i = 0; i < Nrows3; i++) {
-		std::cout << "[ ";
-		for(int j = 0; j < Ncols3; j++) 
-			std::cout << d_matrix3[j * Nrows3 + i] << " ";
-		std::cout << "]\n";
-	}
-
-	return 0; 
-}
-/*
-Matrix transposition is a very common operation in linear algebra.
-From a numerical point of view, it is a memory bound problem since there is practically no arithmetics in it and the operation essentially consists of rearranging the layout of the matrix in memory.
-
-Due to the particular architecture of a GPU and to the cost of performing global memory operations, matrix transposition admits no naive implementation if performance is of interest.
-
-We here compare two different possibilities of performing matrix transposition in CUDA, one using the Thrust library and one using cuBLAS cublas<t>geam.
-The full code we have set up to perform the comparison is downloadable from a Visual Studio 2010 project.
-Here are the results of the tests performed on a Kepler K20c card:
-
-Matrix Transposition
-
-As you can see, the cuBLAS cublas<t>geam definitely outperforms the solution using Thrust and proves to be a very efficient way to perform matrix transposition in CUDA.
-
- 
-*/
-
-inline void __cublasSafeCall(cublasStatus_t err, const char *file, const int line)
-{
-    if( CUBLAS_STATUS_SUCCESS != err) {
-        fprintf(stderr, "CUBLAS error in file '%s', line %d\n \nerror %d \nterminating!\n",__FILE__, __LINE__,err); 
-        getch(); cudaDeviceReset(); assert(0); 
-    }
-}
-
-// convert a linear index to a linear index in the transpose 
-struct transpose_index : public thrust::unary_function<size_t,size_t>
-{
-    size_t m, n;
-
-    __host__ __device__
-    transpose_index(size_t _m, size_t _n) : m(_m), n(_n) {}
-
-    __host__ __device__
-    size_t operator()(size_t linear_index)
-    {
-        size_t i = linear_index / n;
-        size_t j = linear_index % n;
-
-        return m * j + i;
-    }
-};
-
-// convert a linear index to a row index
-struct row_index : public thrust::unary_function<size_t,size_t>
-{
-    size_t n;
-
-    __host__ __device__
-    row_index(size_t _n) : n(_n) {}
-
-    __host__ __device__
-
-    size_t operator()(size_t i)
-    {
-        return i / n;
-    }
-};
-
-// transpose an M-by-N array
-template <typename T>
-void transpose(size_t m, size_t n, thrust::device_vector<T>& src, thrust::device_vector<T>& dst)
-{
-    thrust::counting_iterator<size_t> indices(0);
-
-    thrust::gather
-    (thrust::make_transform_iterator(indices, transpose_index(n, m)),
-    thrust::make_transform_iterator(indices, transpose_index(n, m)) + dst.size(),
-    src.begin(),dst.begin());
-}
-
-// print an M-by-N array
-template <typename T>
-void print(size_t m, size_t n, thrust::device_vector<T>& d_data)
-{
-    thrust::host_vector<T> h_data = d_data;
-
-    for(size_t i = 0; i < m; i++)
-    {
-        for(size_t j = 0; j < n; j++)
-            std::cout << std::setw(8) << h_data[i * n + j] << " ";
-            std::cout << "\n";
-    }
-}
-
-int matrix_transpose(void)
-{
-    size_t m = 5; // number of rows
-    size_t n = 4; // number of columns
-
-    // 2d array stored in row-major order [(0,0), (0,1), (0,2) ... ]
-    thrust::device_vector<double> data(m * n, 1.);
-    data[1] = 2.;
-    data[3] = 3.;
-
-    std::cout << "Initial array" << std::endl;
-    print(m, n, data);
-
-    std::cout << "Transpose array - Thrust" << std::endl;
-    thrust::device_vector<double> transposed_thrust(m * n);
-    transpose(m, n, data, transposed_thrust);
-    print(n, m, transposed_thrust);
-
-    std::cout << "Transpose array - cuBLAS" << std::endl;
-    thrust::device_vector<double> transposed_cuBLAS(m * n);
-    double* dv_ptr_in  = thrust::raw_pointer_cast(data.data());
-    double* dv_ptr_out = thrust::raw_pointer_cast(transposed_cuBLAS.data());
-    double alpha = 1.;
-    double beta  = 0.;
-    cublasHandle_t handle;
-    cublasSafeCall(cublasCreate(&handle));
-    cublasSafeCall(cublasDgeam(handle, CUBLAS_OP_T, CUBLAS_OP_T, m, n, &alpha, dv_ptr_in, n, &beta, dv_ptr_in, n, dv_ptr_out, m)); 
-    print(n, m, transposed_cuBLAS);
-
-    getch();
-
-    return 0;
-}
-
-
-#define m 6 // a - mxk matrix
-#define n 4 // b - kxn matrix
-#define k 5 // c - mxn matrix
-
-#define SWAP(a,b,tmp) { (tmp)=(a); (a)=(b); (b)=(tmp); }
-
-// https://www.christophlassner.de/using-blas-from-c-with-row-major-data.html
-void cublasRowMajorSgemm(float *a, float *b, float *c) {
-    int i,j; // i-row valex, j-column valex
-    cublasHandle_t handle; // CUBLAS context
-    cublasCreate(&handle); // initialize CUBLAS context
-    float al=1.0f; // al =1
-    float bet=1.0f; // bet =1
-
-    // b^T = nxk matrix
-    // a^T = kxm matrix
-    // c^T = nxm matrix
-    // c^T = b^T * a^T
-
-    cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,n,m,k,&al,b,n,a,k,&bet,c,n);
-    cudaDeviceSynchronize();
-    printf ("c after Sgemm :\n");
-    for(i=0;i<m;i++){
-        for(j=0;j<n;j++){
-            printf("%7.0f",c[i*n+j]);
-        }
-        printf("\n");
-    }
-    cublasDestroy(handle); // destroy CUBLAS context
-}
-int cublas_gemm_c(void) {
-    int i,j, ind; // i-row valex, j-column valex
-    float *a; // mxk matrix
-    float *b; // kxn matrix
-    float *c; // mxn matrix
-    // unified memory for a,b,c
-    cudaMallocManaged(&a, m*k*sizeof(cuComplex));
-    cudaMallocManaged(&b, k*n*sizeof(cuComplex));
-    cudaMallocManaged(&c, m*n*sizeof(cuComplex));
-    // define an mxk matrix a column by column
-    int val=0; // a:
-    for(i=0;i<m*k;i++){ a[i] = (float)val++; }
-    printf ("a:\n");
-    ind=0;
-    for (i=0;i<m;i++){
-        for (j=0;j<k;j++){
-            printf("%5.0f",a[ind++]);
-        }
-        printf ("\n");
-    }
-    // define a kxn matrix b column by column
-    val=0; // b:
-    for(i=0;i<k*n;i++){ b[i] = (float)val++; }
-    printf ("b:\n");
-    ind=0;
-    for (i=0;i<k;i++){
-        for (j=0;j<n;j++){
-            printf("%5.0f",b[ind++]);
-        }
-        printf ("\n");
-    }
-    // define an mxn matrix c column by column
-    val=0; // c:
-    for(i=0;i<m*n;i++){ c[i] = (float)0; }
-    printf ("c:\n");
-    ind=0;
-    for (i=0;i<m;i++){
-        for (j=0;j<n;j++){
-            printf("%5.0f",c[ind++]);
-        }
-        printf ("\n");
-    }
-    cublasRowMajorSgemm(a, b, c);
-    cudaFree(a); // free memory
-    cudaFree(b); // free memory
-    cudaFree(c); // free memory
-    return EXIT_SUCCESS ;
-}
-
-
-#define IDX2C(i,j,ld) (((j)*(ld))+(i))
-#define m 6 // a - mxk matrix
-#define n 4 // b - kxn matrix
-#define k 5 // c - mxn matrix
-
-int cublas_gemm_f(void) {
-    cublasHandle_t handle; // CUBLAS context
-    int i,j; // i-row valex, j-column valex
-    float *a; // mxk matrix
-    float *b; // kxn matrix
-    float *c; // mxn matrix
-    // unified memory for a,b,c
-    cudaMallocManaged(&a, m*k*sizeof(cuComplex));
-    cudaMallocManaged(&b, k*n*sizeof(cuComplex));
-    cudaMallocManaged(&c, m*n*sizeof(cuComplex));
-    // define an mxk matrix a column by column
-    int val=0; // a:
-    for (i=0;i<m;i++){
-        for (j=0;j<k;j++){
-            a[IDX2C(i,j,m)] = (float)val++;
-        }
-    }
-    printf ("a:\n");
-    for (i=0;i<m;i++){
-        for (j=0;j<k;j++){
-            printf("%5.0f",a[IDX2C(i,j,m)]);
-        }
-        printf ("\n");
-    }
-    // define a kxn matrix b column by column
-    val=0; // b:
-    for (i=0;i<k;i++){
-        for (j=0;j<n;j++){
-            b[IDX2C(i,j,k)] = (float)val++;
-        }
-    }
-    printf ("b:\n");
-    for (i=0;i<k;i++){
-        for (j=0;j<n;j++){
-            printf("%5.0f",b[IDX2C(i,j,k)]);
-        }
-        printf ("\n");
-    }
-    // define an mxn matrix c column by column
-    val=0; // c:
-    for (i=0;i<m;i++){
-        for (j=0;j<n;j++){
-            c[IDX2C(i,j,m)] = (float)0;
-        }
-    }
-    printf ("c:\n");
-    for (i=0;i<m;i++){
-        for (j=0;j<n;j++){
-            printf("%5.0f",c[IDX2C(i,j,m)]);
-        }
-        printf ("\n");
-    }
-    cublasCreate(&handle); // initialize CUBLAS context
-    float al=1.0f; // al =1
-    float bet=1.0f; // bet =1
-    // matrix - matrix multiplication : c = al*a*b + bet *c
-    // a -mxk matrix , b -kxn matrix , c -mxn matrix ;
-    // al, bet - scalars
-    cublasSgemm(handle,CUBLAS_OP_N,CUBLAS_OP_N,m,n,k,&al,a,m,b,k,&bet,c,m);
-    cudaDeviceSynchronize();
-    printf ("c after Sgemm :\n");
-    for(i=0;i<m;i++){
-        for(j=0;j<n;j++){
-            printf("%7.0f",c[IDX2C(i,j,m)]); // print c after Sgemm
-        }
-        printf("\n");
-    }
-    cudaFree(a); // free memory
-    cudaFree(b); // free memory
-    cudaFree(c); // free memory
-    cublasDestroy(handle); // destroy CUBLAS context
-    return EXIT_SUCCESS ;
 }
 
 
 ///////////////////////////////////////////////////////////////////////
 
-/*
- * A simple example of performing matrix-vector multiplication using the cuBLAS
- * library and some randomly generated inputs.
- */
+__global__ void kernel(float *a, int offset)
+{
+  int i = offset + threadIdx.x + blockIdx.x*blockDim.x;
+  float x = (float)i;
+  float s = sinf(x);
+  float c = cosf(x);
+  a[i] = a[i] + sqrtf(s*s+c*c);
+}
 
-/*
- * M = # of rows
- * N = # of columns
- */
+float maxError(float *a, int n)
+{
+  float maxE = 0;
+  for (int i = 0; i < n; i++) {
+    float error = fabs(a[i]-1.0f);
+    if (error > maxE) maxE = error;
+  }
+  return maxE;
+}
+
+
+int overlap(int argc, char **argv)
+{
+  const int blockSize = 256, nStreams = 4;// blockSize=threadCount
+  const int n = 4 * 1024 * blockSize * nStreams;
+  const int streamSize = n / nStreams;// == one stream size == 4 * 1024 * blockSize
+  const int streamBytes = streamSize * sizeof(float);
+  const int total_bytes = n * sizeof(float);
+
+  int devId = 0;
+  if (argc > 1) devId = atoi(argv[1]);
+
+  cudaDeviceProp prop;
+  checkCuda( cudaGetDeviceProperties(&prop, devId));
+  printf("Device : %s\n", prop.name);
+  checkCuda( cudaSetDevice(devId) );
+
+  // 호스트  고정 메모리와 디바이스 메모리 할당
+  float *a, *d_a;
+  checkCuda( cudaMallocHost((void**)&a, total_bytes) );      // host pinned
+  checkCuda( cudaMalloc((void**)&d_a, total_bytes) ); // device
+
+  float ms; // milliseconds 타이머
+
+  // 이벤트 및 스트림 생성
+  cudaEvent_t startEvent, stopEvent, dummyEvent;
+  cudaStream_t stream[nStreams];
+  checkCuda( cudaEventCreate(&startEvent) );
+  checkCuda( cudaEventCreate(&stopEvent) );
+  checkCuda( cudaEventCreate(&dummyEvent) );
+  for (int i = 0; i < nStreams; ++i)
+    checkCuda( cudaStreamCreate(&stream[i]) );
+
+  // 기본 케이스 - 순차적 메모리 전송과 커널 호출
+  memset(a, 0, total_bytes);
+  checkCuda( cudaEventRecord(startEvent,0) );
+  checkCuda( cudaMemcpy(d_a, a, total_bytes, cudaMemcpyHostToDevice) );
+
+  kernel<<<n/blockSize, blockSize>>>(d_a, 0);//gridSize=4*1024(blockCount)
+
+  checkCuda( cudaMemcpy(a, d_a, total_bytes, cudaMemcpyDeviceToHost) );
+
+  checkCuda( cudaEventRecord(stopEvent, 0) );
+  checkCuda( cudaEventSynchronize(stopEvent) );
+  checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+  printf("Time for sequential transfer and execute (ms): %f\n", ms);
+  printf("  max error: %e\n", maxError(a, n));
+
+  // 비동기 버전 1: [복사-커널호출-복사]를 루프로 반복 수행
+  memset(a, 0, total_bytes);
+  checkCuda( cudaEventRecord(startEvent,0) );
+  for (int i = 0; i < nStreams; ++i) {
+    int offset = i * streamSize;
+    checkCuda( cudaMemcpyAsync(&d_a[offset], &a[offset],
+                               streamBytes, cudaMemcpyHostToDevice,
+                               stream[i]) );
+    /*
+    각 스레드마다 4096 개의 행렬 원소들을 처리한다.
+    ex: thread 0 -> d[0]~d[4096-1]
+    하나의 block이 256개의 thread를 담는다.
+
+    block -> threadIdx.x 0~255
+
+    4개의 block으로 처리하겠다. = grid size 4
+
+    1 stream이 1개의 block 처리하겠다 = 1 stream이 256개의 thread를 처리하겠다.
+    */
+    kernel<<<streamSize/blockSize, blockSize, 0, stream[i]>>>(d_a, offset);
+
+    checkCuda( cudaMemcpyAsync(&a[offset], &d_a[offset],
+                               streamBytes, cudaMemcpyDeviceToHost,
+                               stream[i]) );
+  }
+
+  checkCuda( cudaEventRecord(stopEvent, 0) );
+  checkCuda( cudaEventSynchronize(stopEvent) );
+  checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+  printf("Time for asynchronous V1 transfer and execute (ms): %f\n", ms);
+  printf("  max error: %e\n", maxError(a, n));
+
+  // 비동기 버전 2:
+  // 복사 루프, 커널 호출 루프, 복사 루프를 별개로 수행
+  memset(a, 0, total_bytes);
+  checkCuda( cudaEventRecord(startEvent,0) );
+  for (int i = 0; i < nStreams; ++i)
+  {
+    int offset = i * streamSize;
+    checkCuda( cudaMemcpyAsync(&d_a[offset], &a[offset],
+                               streamBytes, cudaMemcpyHostToDevice,
+                               stream[i]) );
+  }
+  for (int i = 0; i < nStreams; ++i)
+  {
+    int offset = i * streamSize;
+    kernel<<<streamSize/blockSize, blockSize, 0, stream[i]>>>(d_a, offset);
+  }
+  for (int i = 0; i < nStreams; ++i)
+  {
+    int offset = i * streamSize;
+    checkCuda( cudaMemcpyAsync(&a[offset], &d_a[offset],
+                               streamBytes, cudaMemcpyDeviceToHost,
+                               stream[i]) );
+  }
+
+  checkCuda( cudaEventRecord(stopEvent, 0) );
+  checkCuda( cudaEventSynchronize(stopEvent) );
+  checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+  printf("Time for asynchronous V2 transfer and execute (ms): %f\n", ms);
+  printf("  max error: %e\n", maxError(a, n));
+
+  // 메모리 해제
+  checkCuda( cudaEventDestroy(startEvent) );
+  checkCuda( cudaEventDestroy(stopEvent) );
+  checkCuda( cudaEventDestroy(dummyEvent) );
+  for (int i = 0; i < nStreams; ++i)
+    checkCuda( cudaStreamDestroy(stream[i]) );
+  cudaFree(d_a);
+  cudaFreeHost(a);
+
+  return 0;
+}
+
+///////////////////////////////////////////////////////////////////////
+void profileCopies(float        *h_a,
+                   float        *h_b,
+                   float        *d,
+                   unsigned int  n,
+                   char         *desc)
+{
+  printf("\n%s transfers\n", desc);
+
+  unsigned int bytes = n * sizeof(float);
+
+  cudaEvent_t startEvent, stopEvent;
+
+  checkCuda( cudaEventCreate(&startEvent) );
+  checkCuda( cudaEventCreate(&stopEvent) );
+
+  checkCuda( cudaEventRecord(startEvent, 0) );
+  checkCuda( cudaMemcpy(d, h_a, bytes, cudaMemcpyHostToDevice) );
+  checkCuda( cudaEventRecord(stopEvent, 0) );
+  checkCuda( cudaEventSynchronize(stopEvent) );
+
+  float time;
+  checkCuda( cudaEventElapsedTime(&time, startEvent, stopEvent) );
+  printf("  Host to Device bandwidth (GB/s): %f\n", bytes * 1e-6 / time);
+
+  checkCuda( cudaEventRecord(startEvent, 0) );
+  checkCuda( cudaMemcpy(h_b, d, bytes, cudaMemcpyDeviceToHost) );
+  checkCuda( cudaEventRecord(stopEvent, 0) );
+  checkCuda( cudaEventSynchronize(stopEvent) );
+
+  checkCuda( cudaEventElapsedTime(&time, startEvent, stopEvent) );
+  printf("  Device to Host bandwidth (GB/s): %f\n", bytes * 1e-6 / time);
+
+  for (int i = 0; i < n; ++i) {
+    if (h_a[i] != h_b[i]) {
+      printf("*** %s transfers failed ***", desc);
+      break;
+    }
+  }
+
+  // 이벤트 해제
+  checkCuda( cudaEventDestroy(startEvent) );
+  checkCuda( cudaEventDestroy(stopEvent) );
+}
+
+int data_transfer_pageable_vs_pinned()
+{
+  unsigned int nElements = 4*1024*1024;
+  const unsigned int bytes = nElements * sizeof(float);
+
+  //호스트 배열
+  float *h_aPageable, *h_bPageable;
+  float *h_aPinned, *h_bPinned;
+
+  //디바이 스  배열
+  float *d_a;
+
+  //할당 및 초기화
+  h_aPageable = (float*)malloc(bytes);                    // 호스트 pageable 메모리 할당
+  h_bPageable = (float*)malloc(bytes);                    // 호스트 pageable 메모리 할당
+  checkCuda( cudaMallocHost((void**)&h_aPinned, bytes) ); // 호스트 pinned 메모리 할당
+  checkCuda( cudaMallocHost((void**)&h_bPinned, bytes) ); // 호스트 pinned 메모리 할당
+  checkCuda( cudaMalloc((void**)&d_a, bytes) );           // 디바이스 메모리 할당
+
+  for (int i = 0; i < nElements; ++i) h_aPageable[i] = i;
+  memcpy(h_aPinned, h_aPageable, bytes);
+  memset(h_bPageable, 0, bytes);
+  memset(h_bPinned, 0, bytes);
+
+  cudaDeviceProp prop;
+  checkCuda( cudaGetDeviceProperties(&prop, 0) );
+
+  printf("\nDevice: %s\n", prop.name);
+  printf("Transfer size (MB): %d\n", bytes / (1024 * 1024));
+
+  // 고정 메모리 전송 성능 비교
+  profileCopies(h_aPageable, h_bPageable, d_a, nElements, "Pageable");
+  profileCopies(h_aPinned, h_bPinned, d_a, nElements, "Pinned");
+  profileCopies(h_aPageable, h_bPageable, d_a, nElements, "Pageable");
+  profileCopies(h_aPinned, h_bPinned, d_a, nElements, "Pinned");
+  profileCopies(h_aPageable, h_bPageable, d_a, nElements, "Pageable");
+  profileCopies(h_aPinned, h_bPinned, d_a, nElements, "Pinned");
+  profileCopies(h_aPageable, h_bPageable, d_a, nElements, "Pageable");
+  profileCopies(h_aPinned, h_bPinned, d_a, nElements, "Pinned");
+
+  printf("\n");
+
+  // 메모리 해제
+  cudaFree(d_a);
+  cudaFreeHost(h_aPinned);
+  cudaFreeHost(h_bPinned);
+  free(h_aPageable);
+  free(h_bPageable);
+
+  return 0;
+}
+
+
+///////////////////////////////////////////////////////////////////////
+
+template <typename T>
+__global__ void offset(T* a, int s)
+{
+  int i = blockDim.x * blockIdx.x + threadIdx.x + s;
+  a[i] = a[i] + 1;
+}
+
+template <typename T>
+__global__ void stride(T* a, int s)
+{
+  int i = (blockDim.x * blockIdx.x + threadIdx.x) * s;
+  a[i] = a[i] + 1;
+}
+
+template <typename T>
+void runTest(int deviceId, int nMB)
+{
+  int blockSize = 256;
+  float ms;
+
+  T *d_a;
+  cudaEvent_t startEvent, stopEvent;
+
+  int n = nMB*1024*1024/sizeof(T);
+
+  // NB:  d_a(33*nMB)
+  checkCuda( cudaMalloc(&d_a, n * 33 * sizeof(T)) );
+
+  checkCuda( cudaEventCreate(&startEvent) );
+  checkCuda( cudaEventCreate(&stopEvent) );
+
+  printf("Offset, Bandwidth (GB/s):\n");
+
+  offset<<<n/blockSize, blockSize>>>(d_a, 0); // warm up
+
+  for (int i = 0; i <= 32; i++) {
+    checkCuda( cudaMemset(d_a, 0, n * sizeof(T)) );
+
+    checkCuda( cudaEventRecord(startEvent,0) );
+    offset<<<n/blockSize, blockSize>>>(d_a, i);
+    checkCuda( cudaEventRecord(stopEvent,0) );
+    checkCuda( cudaEventSynchronize(stopEvent) );
+
+    checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+    printf("%d, %f\n", i, 2*nMB/ms);
+  }
+
+  printf("\n");
+  printf("Stride, Bandwidth (GB/s):\n");
+
+  stride<<<n/blockSize, blockSize>>>(d_a, 1); // warm up
+  for (int i = 1; i <= 32; i++) {
+    checkCuda( cudaMemset(d_a, 0, n * sizeof(T)) );
+
+    checkCuda( cudaEventRecord(startEvent,0) );
+    stride<<<n/blockSize, blockSize>>>(d_a, i);
+    checkCuda( cudaEventRecord(stopEvent,0) );
+    checkCuda( cudaEventSynchronize(stopEvent) );
+
+    checkCuda( cudaEventElapsedTime(&ms, startEvent, stopEvent) );
+    printf("%d, %f\n", i, 2*nMB/ms);
+  }
+
+  checkCuda( cudaEventDestroy(startEvent) );
+  checkCuda( cudaEventDestroy(stopEvent) );
+  cudaFree(d_a);
+}
+//------------------------------------------------------------------
+int coaleascing(int argc, char **argv)
+{
+  int nMB = 4;
+  int deviceId = 0;
+  bool bFp64 = false;
+
+  for (int i = 1; i < argc; i++) {
+    if (!strncmp(argv[i], "dev=", 4))
+      deviceId = atoi((char*)(&argv[i][4]));
+    else if (!strcmp(argv[i], "fp64"))
+      bFp64 = true;
+  }
+
+  cudaDeviceProp prop;
+
+  checkCuda( cudaSetDevice(deviceId) );
+  checkCuda( cudaGetDeviceProperties(&prop, deviceId) );
+  printf("Device: %s\n", prop.name);
+  printf("Transfer size (MB): %d\n", nMB);
+
+  printf("%s Precision\n", bFp64 ? "Double" : "Single");
+
+  if (bFp64) runTest<double>(deviceId, nMB);
+  else       runTest<float>(deviceId, nMB);
+}
+
+///////////////////////////////////////////////////////////////////////
+const int N = 1 << 20;
+
+__global__ void kernel_target(float *x, int n){
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    for (int i = tid; i < n; i += blockDim.x * gridDim.x) {
+        x[i] = sqrt(pow(3.14159,i));
+    }
+}
+void *launch_kernel(void *dummy){
+    float *data;
+    cudaMalloc(&data, N * sizeof(float));
+    kernel_target<<<1, 64>>>(data, N);
+    cudaStreamSynchronize(0);
+    return NULL;
+}
+int multithread(){
+    const int num_threads = 8;
+    pthread_t threads[num_threads];
+    for (int i = 0; i < num_threads; i++) {
+        if (pthread_create(&threads[i], NULL, launch_kernel, 0)) {
+            fprintf(stderr, "Error creating threadn");
+     }
+   }
+    for (int i = 0; i < num_threads; i++) {
+        if(pthread_join(threads[i], NULL)) {
+            fprintf(stderr, "Error joining threadn");
+            return 2;
+        }
+    }
+    cudaDeviceReset();
+    return 0;
+}
+
+///////////////////////////////////////////////////////////////////////
+
 int ROWS = 1024;
 int COLS = 1024;
 
-/*
- * Generate a matrix with M rows and N columns in column-major order. The matrix
- * will be filled with random single-precision floating-point values between 0
- * and 100.
- */
 void generate_random_dense_matrix(int M, int N, float **outA)
 {
     int i, j;
     double rand_max = (double)RAND_MAX;
     float *A = (float *)malloc(sizeof(float) * M * N);
 
-    for (j = 0; j < N; j++){// For each column
-        for (i = 0; i < M; i++){// For each row
+    for (j = 0; j < N; j++){//열
+        for (i = 0; i < M; i++){//행
             double drand = (double)rand();
-            A[j * M + i] = (drand / rand_max) * 100.0;
+            A[j * M + i] = (drand / rand_max) * 100.0; //0-100 사이 값
         }
     }
     *outA = A;
 }
-
-///////////////////////////////////////////////////////////////////////
 
 int cublasMM(int argc, char **argv)
 {
@@ -1046,31 +488,31 @@ int cublasMM(int argc, char **argv)
     beta = 4.0f;
     int N = ROWS;
     int M = COLS;
-    // Generate inputs
+    // 입력 데이터 초기화
     srand(9384);
     generate_random_dense_matrix(M, N, &A);
     generate_random_dense_matrix(N, M, &B);
     C = (float *)malloc(sizeof(float) * M * M);
     memset(C, 0x00, sizeof(float) * M * M);
 
-    // Create the cuBLAS handle
+    // cuBLAS 핸들러 생성
     CHECK_CUBLAS(cublasCreate(&handle));
 
-    // Allocate device memory
+    // 디바이스 메모리 할당
     CHECK(cudaMalloc((void **)&dA, sizeof(float) * M * N));
     CHECK(cudaMalloc((void **)&dB, sizeof(float) * N * M));
     CHECK(cudaMalloc((void **)&dC, sizeof(float) * M * M));
 
-    // Transfer inputs to the device
+    // 디바이스로 데이터 전송
     CHECK_CUBLAS(cublasSetMatrix(M, N, sizeof(float), A, M, dA, M));
     CHECK_CUBLAS(cublasSetMatrix(N, M, sizeof(float), B, N, dB, N));
     CHECK_CUBLAS(cublasSetMatrix(M, M, sizeof(float), C, M, dC, M));
 
-    // Execute the matrix-vector multiplication
-    CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, M, N, &alpha,
+    // 행렬-벡터 곱 수행
+    CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, M, N, &alpha,
                 dA, M, dB, N, &beta, dC, M));
 
-    // Retrieve the output vector from the device
+    // 결과 값 반환 및 확인
     CHECK_CUBLAS(cublasGetMatrix(M, M, sizeof(float), dC, M, C, M));
 
     for (j = 0; j < 10; j++)
@@ -1113,36 +555,33 @@ int cublasMMAsync(int argc, char **argv)
     beta = 4.0f;
     int N = ROWS;
     int M = COLS;
-    // Generate inputs
+    // 입력 데이터 초기화
     srand(9384);
     generate_random_dense_matrix(M, N, &A);
     generate_random_dense_matrix(N, M, &B);
     C = (float *)malloc(sizeof(float) * M * M);
     memset(C, 0x00, sizeof(float) * M * M);
 
-    // Create the cuBLAS handle
+    // cuBLAS 핸들러 생성
     CHECK_CUBLAS(cublasCreate(&handle));
     CHECK(cudaStreamCreate(&stream));
     CHECK_CUBLAS(cublasSetStream(handle, stream));
 
-    // Allocate device memory
+    // 디바이스 메모리 할당
     CHECK(cudaMalloc((void **)&dA, sizeof(float) * M * N));
     CHECK(cudaMalloc((void **)&dB, sizeof(float) * N * M));
     CHECK(cudaMalloc((void **)&dC, sizeof(float) * M * M));
 
-    // Transfer inputs to the device
-    CHECK_CUBLAS(cublasSetMatrixAsync(M, N, sizeof(float), A, M, dA, M,
-                stream));
-    CHECK_CUBLAS(cublasSetMatrixAsync(N, M, sizeof(float), B, N, dB, N,
-                stream));
-    CHECK_CUBLAS(cublasSetMatrixAsync(M, M, sizeof(float), C, M, dC, M,
-                stream));
+    // 디바이스로 데이터 비동기 전송
+    CHECK_CUBLAS(cublasSetMatrixAsync(M, N, sizeof(float), A, M, dA, M, stream));
+    CHECK_CUBLAS(cublasSetMatrixAsync(N, M, sizeof(float), B, N, dB, N, stream));
+    CHECK_CUBLAS(cublasSetMatrixAsync(M, M, sizeof(float), C, M, dC, M, stream));
 
-    // Execute the matrix-vector multiplication
+    // 행렬-벡터 곱 수행
     CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, M, M, N, &alpha,
                 dA, M, dB, N, &beta, dC, M));
 
-    // Retrieve the output vector from the device
+    // 결과 값 반환 및 확인
     CHECK_CUBLAS(cublasGetMatrixAsync(M, M, sizeof(float), dC, M, C, M,
                 stream));
     CHECK(cudaStreamSynchronize(stream));
@@ -1171,6 +610,1090 @@ int cublasMMAsync(int argc, char **argv)
     return 0;
 }
 
+///////////////////////////////////////////////////////////////////////
+
+__global__ void kernel(float *g_data, float value)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    g_data[idx] = g_data[idx] + value;
+}
+
+int checkResult(float *data, const int n, const float x)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (data[i] != x)
+        {
+            printf("Error! data[%d] = %f, ref = %f\n", i, data[i], x);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+int async(int argc, char *argv[])
+{
+    int devID = 0;
+    cudaDeviceProp deviceProps;
+    CHECK(cudaGetDeviceProperties(&deviceProps, devID));
+    printf("> %s running on", argv[0]);
+    printf(" CUDA device [%s]\n", deviceProps.name);
+
+    int num = 1 << 24;
+    int nbytes = num * sizeof(int);
+    float value = 10.0f;
+
+    // 호스트 메모리 할당
+    float *h_a = 0;
+    CHECK(cudaMallocHost((void **)&h_a, nbytes));
+    memset(h_a, 0, nbytes);
+
+    // 디바이스 메모리 할당
+    float *d_a = 0;
+    CHECK(cudaMalloc((void **)&d_a, nbytes));
+    CHECK(cudaMemset(d_a, 255, nbytes));
+
+    // 스레드 레이아웃 설정
+    dim3 block = dim3(512);
+    dim3 grid  = dim3((num + block.x - 1) / block.x);
+
+    // 이벤트 핸들러 생성
+    cudaEvent_t stop;
+    CHECK(cudaEventCreate(&stop));
+
+    // 비동기 메모리 복사 및 커널 호출(모두 스트림 0으로)
+    CHECK(cudaMemcpyAsync(d_a, h_a, nbytes, cudaMemcpyHostToDevice));
+    kernel<<<grid, block>>>(d_a, value);
+    CHECK(cudaMemcpyAsync(h_a, d_a, nbytes, cudaMemcpyDeviceToHost));
+    CHECK(cudaEventRecord(stop));
+
+    // GPU 작업이 진행되는 동안 CPU도 작업 수행
+    unsigned long int counter = 0;
+
+    while (cudaEventQuery(stop) == cudaErrorNotReady) {
+        counter++;
+    }
+
+    printf("CPU executed %lu iterations while waiting for GPU to finish\n",
+           counter);
+
+    bool bFinalResults = (bool) checkResult(h_a, num, value);
+
+    CHECK(cudaEventDestroy(stop));
+    CHECK(cudaFreeHost(h_a));
+    CHECK(cudaFree(d_a));
+
+    CHECK(cudaDeviceReset());
+
+    exit(bFinalResults ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
+
+///////////////////////////////////////////////////////////////////////
+
+#define BDIMX 32
+#define BDIMY 32
+#define IPAD  1
+
+void printData(char *msg, int *in,  const int size)
+{
+    printf("%s: ", msg);
+
+    for (int i = 0; i < size; i++)
+    {
+        printf("%5d", in[i]);
+        fflush(stdout);
+    }
+
+    printf("\n");
+    return;
+}
+
+__global__ void writeRowReadRow (int *out)
+{
+    // 정적 공유 메모리
+    __shared__ int tile[BDIMY][BDIMX]; // x, y
+
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[threadIdx.y][threadIdx.x] = idx; // x, y
+
+    __syncthreads();
+
+    out[idx] = tile[threadIdx.y][threadIdx.x] ;// x, y
+}
+
+__global__ void writeColReadCol (int *out)
+{
+    // 정적 공유 메모리
+    __shared__ int tile[BDIMX][BDIMY]; // y, x
+
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[threadIdx.x][threadIdx.y] = idx;// y, x
+
+    __syncthreads();
+
+    out[idx] = tile[threadIdx.x][threadIdx.y];// y, x
+}
+
+__global__ void writeRowReadCol(int *out)
+{
+    // 정적 공유 메모리
+    __shared__ int tile[BDIMY][BDIMX];
+
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[threadIdx.y][threadIdx.x] = idx;
+
+    __syncthreads();
+
+    out[idx] = tile[threadIdx.x][threadIdx.y];
+}
+
+__global__ void writeRowReadColDyn(int *out)
+{
+    // 동적 공유 메모리
+    extern  __shared__ int tile[];
+
+    unsigned int row_idx = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int col_idx = threadIdx.x * blockDim.y + threadIdx.y;
+
+    tile[row_idx] = row_idx;
+
+    __syncthreads();
+
+    out[row_idx] = tile[col_idx];
+}
+
+__global__ void writeRowReadColPad(int *out)
+{
+    // 정적 공유 메모리 패딩
+    __shared__ int tile[BDIMY][BDIMX + IPAD];
+
+    unsigned int idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[threadIdx.y][threadIdx.x] = idx;
+
+    __syncthreads();
+
+    out[idx] = tile[threadIdx.x][threadIdx.y];
+}
+
+__global__ void writeRowReadColDynPad(int *out)
+{
+    // 동적 공유 메모리 패딩
+    extern  __shared__ int tile[];
+
+    unsigned int row_idx = threadIdx.y * (blockDim.x + IPAD) + threadIdx.x;
+    unsigned int col_idx = threadIdx.x * (blockDim.x + IPAD) + threadIdx.y;
+
+    unsigned int g_idx = threadIdx.y * blockDim.x + threadIdx.x;
+
+    tile[row_idx] = g_idx;
+    __syncthreads();
+    out[g_idx] = tile[col_idx];
+}
+
+
+int smemSquare(int argc, char **argv)
+{
+    // 디바이스 설정
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+    printf("%s at ", argv[0]);
+    printf("device %d: %s ", dev, deviceProp.name);
+    CHECK(cudaSetDevice(dev));
+
+    cudaSharedMemConfig pConfig;
+    CHECK(cudaDeviceGetSharedMemConfig ( &pConfig ));
+    printf("with Bank Mode:%s ", pConfig == 1 ? "4-Byte" : "8-Byte");
+
+    // 배열 크기 설정(2048)
+    int nx = BDIMX;
+    int ny = BDIMY;
+
+    bool iprintf = 0;
+
+    if (argc > 1) iprintf = atoi(argv[1]);
+
+    size_t nBytes = nx * ny * sizeof(int);
+
+    // 실행 구성 설정
+    dim3 block (BDIMX, BDIMY);
+    dim3 grid  (1, 1);
+    printf("<<< grid (%d,%d) block (%d,%d)>>>\n", grid.x, grid.y, block.x,
+           block.y);
+
+    // 디바이스 메모리 할당
+    int *d_C;
+    CHECK(cudaMalloc((int**)&d_C, nBytes));
+    int *gpuRef  = (int *)malloc(nBytes);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeColReadCol<<<grid, block>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set col read col   ", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeRowReadRow<<<grid, block>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set row read row   ", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeRowReadCol<<<grid, block>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set row read col   ", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeRowReadColDyn<<<grid, block, BDIMX*BDIMY*sizeof(int)>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set row read col dyn", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeRowReadColPad<<<grid, block>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set row read col pad", gpuRef, nx * ny);
+
+    CHECK(cudaMemset(d_C, 0, nBytes));
+    writeRowReadColDynPad<<<grid, block, (BDIMX + IPAD)*BDIMY*sizeof(int)>>>(d_C);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
+
+    if(iprintf)  printData("set row read col DP ", gpuRef, nx * ny);
+
+    CHECK(cudaFree(d_C));
+    free(gpuRef);
+
+    CHECK(cudaDeviceReset());
+    return EXIT_SUCCESS;
+}
+
+
+///////////////////////////////////////////////////////////////////////
+#define DIM 128
+
+
+
+extern __shared__ int dsmem[];
+
+int recursiveReduce(int *data, int const size)
+{
+    if (size == 1) return data[0];
+
+    int const stride = size / 2;
+
+    for (int i = 0; i < stride; i++)
+        data[i] += data[i + stride];
+
+    return recursiveReduce(data, stride);
+}
+
+// unroll4 + complete unroll for loop + gmem
+__global__ void reduceGmem(int *g_idata, int *g_odata, unsigned int n)
+{
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    int *idata = g_idata + blockIdx.x * blockDim.x;
+
+    // boundary check
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= n) return;
+
+    // in-place reduction in global memory
+    if (blockDim.x >= 1024 && tid < 512) idata[tid] += idata[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256) idata[tid] += idata[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128) idata[tid] += idata[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64) idata[tid] += idata[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = idata;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = idata[0];
+}
+
+__global__ void reduceSmem(int *g_idata, int *g_odata, unsigned int n)
+{
+    __shared__ int smem[DIM];
+
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+
+    // boundary check
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx >= n) return;
+
+    // convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x;
+
+    // set to smem by each threads
+    smem[tid] = idata[tid];
+    __syncthreads();
+
+    // in-place reduction in shared memory
+    if (blockDim.x >= 1024 && tid < 512) smem[tid] += smem[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256) smem[tid] += smem[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128) smem[tid] += smem[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64)  smem[tid] += smem[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = smem;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = smem[0];
+}
+
+__global__ void reduceSmemDyn(int *g_idata, int *g_odata, unsigned int n)
+{
+    extern __shared__ int smem[];
+
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    int *idata = g_idata + blockIdx.x * blockDim.x;
+
+    // set to smem by each threads
+    smem[tid] = idata[tid];
+    __syncthreads();
+
+    // in-place reduction in global memory
+    if (blockDim.x >= 1024 && tid < 512)  smem[tid] += smem[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256)  smem[tid] += smem[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128) smem[tid] += smem[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64) smem[tid] += smem[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = smem;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = smem[0];
+}
+
+// unroll4 + complete unroll for loop + gmem
+__global__ void reduceGmemUnroll(int *g_idata, int *g_odata, unsigned int n)
+{
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x;
+
+    // convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x * 4;
+
+    // unrolling 4
+    if (idx < n)
+    {
+        int a1, a2, a3, a4;
+        a1 = a2 = a3 = a4 = 0;
+        a1 = g_idata[idx];
+        if (idx + blockDim.x < n) a2 = g_idata[idx + blockDim.x];
+        if (idx + 2 * blockDim.x < n) a3 = g_idata[idx + 2 * blockDim.x];
+        if (idx + 3 * blockDim.x < n) a4 = g_idata[idx + 3 * blockDim.x];
+        g_idata[idx] = a1 + a2 + a3 + a4;
+    }
+
+    __syncthreads();
+
+    // in-place reduction in global memory
+    if (blockDim.x >= 1024 && tid < 512) idata[tid] += idata[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256) idata[tid] += idata[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128) idata[tid] += idata[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64) idata[tid] += idata[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = idata;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = idata[0];
+}
+
+__global__ void reduceSmemUnroll(int *g_idata, int *g_odata, unsigned int n)
+{
+    // static shared memory
+    __shared__ int smem[DIM];
+
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+
+    // global index, 4 blocks of input data processed at a time
+    unsigned int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x;
+
+    // unrolling 4 blocks
+    int tmpSum = 0;
+
+    // boundary check
+    if (idx < n)
+    {
+        int a1, a2, a3, a4;
+        a1 = a2 = a3 = a4 = 0;
+        a1 = g_idata[idx];
+        if (idx + blockDim.x < n) a2 = g_idata[idx + blockDim.x];
+        if (idx + 2 * blockDim.x < n) a3 = g_idata[idx + 2 * blockDim.x];
+        if (idx + 3 * blockDim.x < n) a4 = g_idata[idx + 3 * blockDim.x];
+        tmpSum = a1 + a2 + a3 + a4;
+    }
+
+    smem[tid] = tmpSum;
+    __syncthreads();
+
+    // in-place reduction in shared memory
+    if (blockDim.x >= 1024 && tid < 512) smem[tid] += smem[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256)  smem[tid] += smem[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128)  smem[tid] += smem[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64)   smem[tid] += smem[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = smem;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = smem[0];
+}
+
+__global__ void reduceSmemUnrollDyn(int *g_idata, int *g_odata, unsigned int n)
+{
+    extern __shared__ int smem[];
+
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x;
+
+    // unrolling 4
+    int tmpSum = 0;
+
+    if (idx < n)
+    {
+        int a1, a2, a3, a4;
+        a1 = a2 = a3 = a4 = 0;
+        a1 = g_idata[idx];
+        if (idx + blockDim.x < n) a2 = g_idata[idx + blockDim.x];
+        if (idx + 2 * blockDim.x < n) a3 = g_idata[idx + 2 * blockDim.x];
+        if (idx + 3 * blockDim.x < n) a4 = g_idata[idx + 3 * blockDim.x];
+        tmpSum = a1 + a2 + a3 + a4;
+    }
+
+    smem[tid] = tmpSum;
+    __syncthreads();
+
+    // in-place reduction in global memory
+    if (blockDim.x >= 1024 && tid < 512)  smem[tid] += smem[tid + 512];
+
+    __syncthreads();
+
+    if (blockDim.x >= 512 && tid < 256)  smem[tid] += smem[tid + 256];
+
+    __syncthreads();
+
+    if (blockDim.x >= 256 && tid < 128) smem[tid] += smem[tid + 128];
+
+    __syncthreads();
+
+    if (blockDim.x >= 128 && tid < 64) smem[tid] += smem[tid + 64];
+
+    __syncthreads();
+
+    // unrolling warp
+    if (tid < 32)
+    {
+        volatile int *vsmem = smem;
+        vsmem[tid] += vsmem[tid + 32];
+        vsmem[tid] += vsmem[tid + 16];
+        vsmem[tid] += vsmem[tid +  8];
+        vsmem[tid] += vsmem[tid +  4];
+        vsmem[tid] += vsmem[tid +  2];
+        vsmem[tid] += vsmem[tid +  1];
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = smem[0];
+}
+
+__global__ void reduceNeighboredGmem(int *g_idata, int *g_odata,
+                                     unsigned int  n)
+{
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x;
+
+    // boundary check
+    if (idx >= n) return;
+
+    // in-place reduction in global memory
+    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    {
+        if ((tid % (2 * stride)) == 0)
+        {
+            idata[tid] += idata[tid + stride];
+        }
+
+        // synchronize within threadblock
+        __syncthreads();
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = idata[0];
+}
+
+__global__ void reduceNeighboredSmem(int *g_idata, int *g_odata,
+                                     unsigned int  n)
+{
+    __shared__ int smem[DIM];
+
+    // set thread ID
+    unsigned int tid = threadIdx.x;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // convert global data pointer to the local pointer of this block
+    int *idata = g_idata + blockIdx.x * blockDim.x;
+
+    // boundary check
+    if (idx >= n) return;
+
+    smem[tid] = idata[tid];
+    __syncthreads();
+
+    // in-place reduction in global memory
+    for (int stride = 1; stride < blockDim.x; stride *= 2)
+    {
+        if ((tid % (2 * stride)) == 0)
+        {
+            smem[tid] += smem[tid + stride];
+        }
+
+        // synchronize within threadblock
+        __syncthreads();
+    }
+
+    // write result for this block to global mem
+    if (tid == 0) g_odata[blockIdx.x] = smem[0];
+}
+
+int reduceSum(int argc, char **argv)
+{
+    // 디바이스 설정
+    int dev = 0;
+    cudaDeviceProp deviceProp;
+    CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+    printf("%s starting reduction at ", argv[0]);
+    printf("device %d: %s ", dev, deviceProp.name);
+    CHECK(cudaSetDevice(dev));
+
+    bool bResult = false;
+
+    // 초기화
+    int size = 1 << 22;
+    printf("    with array size %d  ", size);
+
+    // 실행 구성 설정
+    int blocksize = DIM;
+
+    dim3 block (blocksize, 1);
+    dim3 grid  ((size + block.x - 1) / block.x, 1);
+    printf("grid %d block %d\n", grid.x, block.x);
+
+    // 호스트 메모리 할당
+    size_t bytes = size * sizeof(int);
+    int *h_idata = (int *) malloc(bytes);
+    int *h_odata = (int *) malloc(grid.x * sizeof(int));
+    int *tmp     = (int *) malloc(bytes);
+
+    // initialize the array
+    for (int i = 0; i < size; i++)
+    {
+        h_idata[i] = (int)( rand() & 0xFF );
+    }
+
+    memcpy (tmp, h_idata, bytes);
+
+    int gpu_sum = 0;
+
+    // 디바이스 메모리 할당
+    int *d_idata = NULL;
+    int *d_odata = NULL;
+    CHECK(cudaMalloc((void **) &d_idata, bytes));
+    CHECK(cudaMalloc((void **) &d_odata, grid.x * sizeof(int)));
+
+    int cpu_sum = recursiveReduce (tmp, size);
+    printf("cpu reduce          : %d\n", cpu_sum);
+
+
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes,                cudaMemcpyHostToDevice));
+    reduceNeighboredGmem<<<grid.x, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x; i++) gpu_sum += h_odata[i];
+
+    printf("reduceNeighboredGmem: %d <<<grid %d block %d>>>\n", gpu_sum, grid.x, block.x);
+
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceNeighboredSmem<<<grid.x, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x * sizeof(int), cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x; i++) gpu_sum += h_odata[i];
+
+    printf("reduceNeighboredSmem: %d <<<grid %d block %d>>>\n", gpu_sum, grid.x, block.x);
+
+    // reduce gmem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceGmem<<<grid.x, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x; i++) gpu_sum += h_odata[i];
+
+    printf("reduceGmem          : %d <<<grid %d block %d>>>\n", gpu_sum, grid.x,
+           block.x);
+
+    // reduce smem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceSmem<<<grid.x, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x; i++) gpu_sum += h_odata[i];
+
+    printf("reduceSmem          : %d <<<grid %d block %d>>>\n", gpu_sum, grid.x,
+           block.x);
+
+    // reduce smem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceSmemDyn<<<grid.x, block, blocksize*sizeof(int)>>>(d_idata, d_odata,
+            size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x; i++) gpu_sum += h_odata[i];
+
+    printf("reduceSmemDyn       : %d <<<grid %d block %d>>>\n", gpu_sum, grid.x,
+           block.x);
+
+    // reduce gmem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceGmemUnroll<<<grid.x / 4, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x / 4 * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x / 4; i++) gpu_sum += h_odata[i];
+
+    printf("reduceGmemUnroll4   : %d <<<grid %d block %d>>>\n", gpu_sum,
+            grid.x / 4, block.x);
+
+    // reduce smem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceSmemUnroll<<<grid.x / 4, block>>>(d_idata, d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x / 4 * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x / 4; i++) gpu_sum += h_odata[i];
+
+    printf("reduceSmemUnroll4   : %d <<<grid %d block %d>>>\n", gpu_sum,
+            grid.x / 4, block.x);
+
+    // reduce smem
+    CHECK(cudaMemcpy(d_idata, h_idata, bytes, cudaMemcpyHostToDevice));
+    reduceSmemUnrollDyn<<<grid.x / 4, block, DIM*sizeof(int)>>>(d_idata,
+            d_odata, size);
+    CHECK(cudaMemcpy(h_odata, d_odata, grid.x / 4 * sizeof(int),
+                     cudaMemcpyDeviceToHost));
+    gpu_sum = 0;
+
+    for (int i = 0; i < grid.x / 4; i++) gpu_sum += h_odata[i];
+
+    printf("reduceSmemDynUnroll4: %d <<<grid %d block %d>>>\n", gpu_sum,
+            grid.x / 4, block.x);
+
+    // 메모리 해제
+    free(h_idata);
+    free(h_odata);
+    CHECK(cudaFree(d_idata));
+    CHECK(cudaFree(d_odata));
+
+    CHECK(cudaDeviceReset());
+
+    bResult = (gpu_sum == cpu_sum);
+
+    if(!bResult) printf("Test failed!\n");
+
+    return EXIT_SUCCESS;
+}
+
+__device__ void clock_block(clock_t *d_o, clock_t clock_count)
+{
+	unsigned int start_clock = (unsigned int)clock();
+
+	clock_t clock_offset = 0;
+
+	while (clock_offset < clock_count)
+	{
+		unsigned int end_clock = (unsigned int)clock();
+
+		// The code below should work like
+		// this (thanks to modular arithmetics):
+		//
+		// clock_offset = (clock_t) (end_clock > start_clock ?
+		//                           end_clock - start_clock :
+		//                           end_clock + (0xffffffffu - start_clock));
+		//
+		// Indeed, let m = 2^32 then
+		// end - start = end + m - start (mod m).
+
+		clock_offset = (clock_t)(end_clock - start_clock);
+	}
+
+	d_o[0] = clock_offset;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// clock_block()을 호출하는 커널.
+//두 커널이 동일한 스트림 상에서 의존하도록 한다.
+
+__global__ void kernel_A(clock_t *d_o, clock_t clock_count)
+{
+	clock_block(d_o, clock_count);
+}
+__global__ void kernel_B(clock_t *d_o, clock_t clock_count)
+{
+	clock_block(d_o, clock_count);
+}
+__global__ void kernel_C(clock_t *d_o, clock_t clock_count)
+{
+	clock_block(d_o, clock_count);
+}
+__global__ void kernel_D(clock_t *d_o, clock_t clock_count)
+{
+	clock_block(d_o, clock_count);
+}
+int simpleHyperQ(int argc, char **argv)
+{
+	int nstreams = 8;       // 스트림 개수
+	float kernel_time = 10; // 커널이 실행될 ms 단위 시간
+	float elapsed_time;
+	int cuda_device = 0;
+
+	char * iname = "CUDA_DEVICE_MAX_CONNECTIONS";
+	setenv(iname, "4", 1); // 4 or 32
+	char *ivalue = getenv(iname);
+	printf("%s = %s\n", iname, ivalue);
+
+	cudaDeviceProp deviceProp;
+	CHECK(cudaGetDevice(&cuda_device));
+	CHECK(cudaGetDeviceProperties(&deviceProp, cuda_device));
+
+	printf("> Detected Compute SM %d.%d hardware with %d multi-processors\n",
+		deviceProp.major, deviceProp.minor, deviceProp.multiProcessorCount);
+
+	// 호스트 메모리 할당
+	clock_t *a = 0;
+	CHECK(cudaMallocHost((void **)&a, sizeof(clock_t)));
+
+	// 디바이스 메모리 할당
+	clock_t *d_a = 0;
+	CHECK(cudaMalloc((void **)&d_a, 2 * nstreams * sizeof(clock_t)));
+
+	// 스트림 객체에 대한 메모리 할당 및 생성
+	cudaStream_t *streams = (cudaStream_t *)malloc(nstreams * sizeof(cudaStream_t));
+
+	for (int i = 0; i < nstreams; i++)
+	{
+		CHECK(cudaStreamCreate(&(streams[i])));
+	}
+
+	// 이벤트 핸들러 생성
+	cudaEvent_t start_event, stop_event;
+	CHECK(cudaEventCreate(&start_event));
+	CHECK(cudaEventCreate(&stop_event));
+
+	// Target time per kernel = kernel_time ms, clockRate = in KHz
+	// Target number of clocks = target time * clock frequency
+#if defined(__arm__) || defined(__aarch64__)
+	clock_t time_clocks = (clock_t)(kernel_time * (deviceProp.clockRate / 1000));
+#else
+	clock_t time_clocks = (clock_t)(kernel_time * deviceProp.clockRate);
+#endif
+	clock_t total_clocks = 0;
+
+	CHECK(cudaEventRecord(start_event, 0));
+
+	for (int i = 0; i < nstreams; ++i)
+	{
+		kernel_A <<<1, 1, 0, streams[i] >>>(&d_a[2 * i], time_clocks);
+		total_clocks += time_clocks;
+		kernel_B <<<1, 1, 0, streams[i] >>>(&d_a[2 * i + 1], time_clocks);
+		total_clocks += time_clocks;
+		kernel_C <<<1, 1, 0, streams[i] >>>(&d_a[2 * i], time_clocks);
+		total_clocks += time_clocks;
+		kernel_D <<<1, 1, 0, streams[i] >>>(&d_a[2 * i + 1], time_clocks);
+		total_clocks += time_clocks;
+	}
+
+	// 스트림 0 상의 중단 이벤트
+	CHECK(cudaEventRecord(stop_event, 0));
+
+	// 여기서 CPU는 GPU와 독립적으로 병렬 작업 수행 진행.
+	// 여기서는 모든 작업이 완료될 때까지 대기한다.
+
+	CHECK(cudaEventSynchronize(stop_event));
+	CHECK(cudaEventElapsedTime(&elapsed_time, start_event, stop_event));
+
+	printf("Expected time for serial execution of %d sets of kernels is between approx. %.3fs and %.3fs\n", nstreams, (nstreams + 1) * kernel_time / 1000.0f, 2 * nstreams *kernel_time / 1000.0f);
+	printf("Expected time for fully concurrent execution of %d sets of kernels is approx. %.3fs\n", nstreams, 2 * kernel_time / 1000.0f);
+	printf("Measured time for sample = %.3fs\n", elapsed_time / 1000.0f);
+
+	bool bTestResult = (a[0] >= total_clocks);
+
+	for (int i = 0; i < nstreams; i++)
+	{
+		cudaStreamDestroy(streams[i]);
+	}
+
+	free(streams);
+	cudaEventDestroy(start_event);
+	cudaEventDestroy(stop_event);
+	cudaFreeHost(a);
+	cudaFree(d_a);
+
+	return (bTestResult ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
+/////////////////////////////////////////////////////////////////////////////////
+#define LOOP_COUNT 3000000
+
+void CUDART_CB my_callback(cudaStream_t stream, cudaError_t status, void *data)
+{
+	printf("callback from stream %d\n", *((int *)data));
+}
+
+__global__ void kernel_1()
+{
+	double sum = 0.0;
+
+	for (int i = 0; i < LOOP_COUNT; i++)
+	{
+		sum = sum + tan(0.1) * tan(0.1);
+	}
+}
+
+__global__ void kernel_2()
+{
+	double sum = 0.0;
+
+	for (int i = 0; i < LOOP_COUNT; i++)
+	{
+		sum = sum + tan(0.1) * tan(0.1);
+	}
+}
+
+__global__ void kernel_3()
+{
+	double sum = 0.0;
+
+	for (int i = 0; i < LOOP_COUNT; i++)
+	{
+		sum = sum + tan(0.1) * tan(0.1);
+	}
+}
+
+__global__ void kernel_4()
+{
+	double sum = 0.0;
+
+	for (int i = 0; i < LOOP_COUNT; i++)
+	{
+		sum = sum + tan(0.1) * tan(0.1);
+	}
+}
+
+
+
+int simpleCallback(int argc, char **argv)
+{
+	int n_streams = 8;
+
+	if (argc > 2) n_streams = atoi(argv[2]);
+
+	int dev = 0;
+	cudaDeviceProp deviceProp;
+	CHECK(cudaGetDeviceProperties(&deviceProp, dev));
+	printf("> %s Starting...\n", argv[0]);
+	printf("> Using Device %d: %s\n", dev, deviceProp.name);
+	CHECK(cudaSetDevice(dev));
+
+	printf("> Compute Capability %d.%d hardware with %d multi-processors\n",
+		deviceProp.major, deviceProp.minor, deviceProp.multiProcessorCount);
+
+	// 최대 연결 수 설정
+	char * iname = "CUDA_DEVICE_MAX_CONNECTIONS";
+	setenv(iname, "8", 1);
+	char *ivalue = getenv(iname);
+	printf("> %s = %s\n", iname, ivalue);
+	printf("> with streams = %d\n", n_streams);
+
+	// 스트림 할당 및 초기화
+	cudaStream_t *streams = (cudaStream_t *)malloc(n_streams * sizeof(
+		cudaStream_t));
+
+	for (int i = 0; i < n_streams; i++)
+	{
+		CHECK(cudaStreamCreate(&(streams[i])));
+	}
+
+	dim3 block(1);
+	dim3 grid(1);
+	cudaEvent_t start_event, stop_event;
+	CHECK(cudaEventCreate(&start_event));
+	CHECK(cudaEventCreate(&stop_event));
+
+	int stream_ids[4];
+
+	CHECK(cudaEventRecord(start_event, 0));
+
+	for (int i = 0; i < n_streams; i++)
+	{
+		stream_ids[i] = i;
+		kernel_1 <<<grid, block, 0, streams[i] >>>();
+		kernel_2 <<<grid, block, 0, streams[i] >>>();
+		kernel_3 <<<grid, block, 0, streams[i] >>>();
+		kernel_4 <<<grid, block, 0, streams[i] >>>();
+		CHECK(cudaStreamAddCallback(streams[i], my_callback,
+			(void *)(stream_ids + i), 0));
+	}
+
+	CHECK(cudaEventRecord(stop_event, 0));
+	CHECK(cudaEventSynchronize(stop_event));
+
+	float elapsed_time;
+	CHECK(cudaEventElapsedTime(&elapsed_time, start_event, stop_event));
+	printf("Measured time for parallel execution = %.3fs\n", elapsed_time);
+
+	// 스트림 해제
+	for (int i = 0; i < n_streams; i++)
+	{
+		CHECK(cudaStreamDestroy(streams[i]));
+	}
+
+	free(streams);
+
+	CHECK(cudaDeviceReset());
+
+	return 0;
+}
 
 int main(int argc, char* argv[]){
 
@@ -1179,62 +1702,65 @@ int main(int argc, char* argv[]){
    printf("run ex : %d\n",ex);
    switch(ex){
     case 1:{
-     printf("debug_segfault\n");
-     debug_segfault(argc, argv);
+     printf("multithread\n");//stream
+     multithread();
      break;
     }
     case 2:{
-     printf("debug_segfault_fixed\n");
-     debug_segfault_fixed(argc, argv);
+     printf("coaleascing\n");
+     coaleascing(argc, argv);
      break;
     }
     case 3:{
-     printf("debug_hazard\n");
-     debug_hazard(argc, argv);
+     printf("shared_memory_reverse\n");//simple smem + sync
+     shared_memory_reverse();
      break;
     }
     case 4:{
-     printf("simpleCublas\n");//from nvidia
-     simpleCublas(argc, argv);
+     printf("reduceSum\n");
+     reduceSum(argc,argv);
      break;
     }
     case 5:{
-     printf("two_point_pair_distance\n");//can be skipped
-     two_point_pair_distance();
+     printf("smemSquare\n");//smem + sync
+     smemSquare(argc,argv);
      break;
     }
     case 6:{
-     printf("submatrix_multiplication\n");//can be skipped
-     submatrix_multiplication();
+     printf("simpleHyperQ\n");//hyper q
+     simpleHyperQ(argc,argv);
      break;
     }
     case 7:{
-     printf("matrix_transpose\n");//can be skipped
-     matrix_transpose();
+     printf("simpleCallback\n");//stream
+     simpleCallback(argc,argv);
      break;
     }
     case 8:{
-     printf("cublas_gemm_c\n");//can be skipped
-     cublas_gemm_c();
+     printf("async\n");//simple async memcpy
+     async(argc,argv);
      break;
     }
     case 9:{
-     printf("cublas_gemm_f\n");//can be skipped
-     cublas_gemm_f();
+     printf("data_transfer_pageable_vs_pinned\n");
+     data_transfer_pageable_vs_pinned();
      break;
-    } 
+    }
     case 10:{
+     printf("overlap\n");//stream
+     overlap(argc,argv);
+     break;
+    }
+    case 11:{
      printf("cublasMM\n");
      cublasMM(argc,argv);
      break;
-    } 
-    case 11:{
+    }
+    case 12:{
      printf("cublasMMAsync\n");
      cublasMMAsync(argc,argv);
      break;
-    } 
-
+    }
   }
   return 0;
 }
-
